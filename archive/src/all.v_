@@ -1,0 +1,980 @@
+// File: adder.v
+// adder.v
+module adder (
+        input  wire [31:0] a,
+        input  wire [31:0] b,
+        output wire [31:0] y
+    );
+
+    assign y = a + b;
+    
+endmodule
+// File: alu.v
+// alu.v
+module alu (
+        input  wire [3:0]  op,
+        input  wire [31:0] a,
+        input  wire [31:0] b,
+        output wire        zero,
+        output reg  [31:0] y
+    );
+
+    assign zero = (y == 0);
+
+    always @ (op, a, b) begin
+        case (op)
+            4'b0000: y = a & b;
+            4'b0001: y = a | b;
+            4'b0010: y = a + b;
+            4'b0110: y = a - b;
+            4'b0111: y = (a < b) ? 1 : 0;
+            4'b1000: y = a << b; // SLL
+            4'b1001: y = a >> b; // SRL
+        endcase
+    end
+
+endmodule
+// File: auxdec.v
+// auxdec.v
+module auxdec (
+        input  wire [1:0] alu_op,
+        input  wire [5:0] funct,
+        
+        /* Lab 7 Modifications */
+//        output wire [2:0] alu_ctrl,
+        output wire [3:0]  alu_ctrl,    // Originally 3-bits but changing to 4-bits to accommodate new instructions
+        output wire [1:0]  muldiv_ctrl,   // For the muldiv unit
+        output wire        we_muldiv,   // Write enable for the muldiv unit
+        output wire        hilo_stream, // To select which HILO reg to stream into MUX
+        output wire        hilo2reg,    // Selecting the HILO reg to be feed into wd_rf
+        output wire        alu_shamt,   // For the SLL and SRL to take into account the shamt value to the ALU
+        output wire        jump_reg     // Jumping based off the data from a register
+        
+    );
+
+//    reg [2:0] ctrl;
+//    assign {alu_ctrl} = ctrl;
+
+    reg [10:0] ctrl;
+    assign {alu_ctrl, muldiv_ctrl, we_muldiv, hilo_stream, hilo2reg, alu_shamt, jump_reg} = ctrl;
+
+    always @ (alu_op, funct) begin
+        case (alu_op)
+            2'b00: ctrl = 11'b0010_00_0_0_0_0_0;          // ADD
+            2'b01: ctrl = 11'b0110_00_0_0_0_0_0;          // SUB
+            default: case (funct)
+                /* Lab 7 Additions */
+                6'b00_1000: ctrl = 11'b0000_00_0_0_0_0_1; // JR
+                6'b00_0000: ctrl = 11'b1000_00_0_0_0_1_0; // SLL
+                6'b00_0010: ctrl = 11'b1001_00_0_0_0_1_0; // SRL
+                6'b01_1001: ctrl = 11'b0000_00_1_0_0_0_0; // MULTU
+                6'b01_0000: ctrl = 11'b0000_00_0_1_1_0_0; // MFHI
+                6'b01_0010: ctrl = 11'b0000_00_0_0_1_0_0; // MFLO
+           
+                /* Original Implementation */
+                6'b10_0100: ctrl = 11'b0000_00_0_0_0_0_0; // AND
+                6'b10_0101: ctrl = 11'b0001_00_0_0_0_0_0; // OR
+                6'b10_0000: ctrl = 11'b0010_00_0_0_0_0_0; // ADD
+                6'b10_0010: ctrl = 11'b0110_00_0_0_0_0_0; // SUB
+                6'b10_1010: ctrl = 11'b0111_00_0_0_0_0_0; // SLT
+                default:    ctrl = 11'bxxxx_xx_x_x_x_x_x;
+            endcase
+        endcase
+    end
+
+endmodule
+// File: button_debouncer.v
+// button_debouncer.v
+module button_debouncer #(parameter depth = 16) (
+        input  wire clk,                 /* 5 KHz clock */
+        input  wire button,              /* Input button from constraints */
+        output reg  debounced_button
+    );
+    
+    localparam history_max = (2**depth)-1;
+
+    /* History of sampled input button */
+    reg [depth-1:0] history;
+
+    always @ (posedge clk) begin
+        /* Move history back one sample and insert new sample */
+        history <= { button, history[depth-1:1] };
+        
+        /* Assert debounced button if it has been in a consistent state throughout history */
+        debounced_button <= (history == history_max) ? 1'b1 : 1'b0;
+    end
+    
+endmodule
+
+
+// File: clk_gen.v
+// clk_gen.v
+module clk_gen (
+        input  wire clk100MHz,
+        input  wire rst,
+        output reg  clk_4sec,
+        output reg  clk_5KHz
+    );
+
+    integer count1, count2;
+
+    always @ (posedge clk100MHz) begin
+        if (rst) begin
+            count1 = 0;
+            count2 = 0;
+            clk_5KHz = 0;
+            clk_4sec = 0;
+        end
+        else begin
+            if (count1 == 200000000) begin
+                clk_4sec = ~clk_4sec;
+                count1 = 0;
+            end
+
+            if (count2 == 10000) begin
+                clk_5KHz = ~clk_5KHz;
+                count2 = 0;
+            end
+
+            count1 = count1 + 1;
+            count2 = count2 + 1;            
+        end
+    end
+
+endmodule
+// File: controlunit.v
+// controlunit.v
+module controlunit (
+        input  wire [5:0]  opcode,
+        input  wire [5:0]  funct,
+        output wire        branch,
+        output wire        jump,
+        output wire        we_reg,
+        output wire        alu_src,
+        output wire        we_dm,
+        output wire        dm2reg,
+        
+        /* Control Signals that are dictated by the opcode */
+        output wire        pc2reg,      // Selecting if we want the program counter to be feed into wd_rf and $ra into rf_wa
+//        output wire        reg_dst,     
+        output wire [1:0]  reg_dst,     // Originally 1-bit but changing to 2-bit
+
+        
+        /* Control Signals that are dictated by the funct */
+//        output wire [2:0]  alu_ctrl,
+        output wire [3:0]  alu_ctrl,    // Originally 3-bits but changing to 4-bits to accommodate new instructions
+        output wire [1:0]  muldiv_ctrl, // For the muldiv unit
+        output wire        we_muldiv,   // Write enable for the muldiv unit
+        output wire        hilo_stream, // To select which HILO reg to stream into MUX
+        output wire        hilo2reg,    // Selecting the HILO reg to be feed into wd_rf
+        output wire        alu_shamt,   // For the SLL and SRL to take into account the shamt value to the ALU
+        output wire        jump_reg     // Jumping based off the data from a register
+        
+    );
+    
+    wire [1:0] alu_op;
+
+    maindec md (
+        .opcode         (opcode),
+        .branch         (branch),
+        .jump           (jump),
+        .reg_dst        (reg_dst),
+        .we_reg         (we_reg),
+        .alu_src        (alu_src),
+        .we_dm          (we_dm),
+        .dm2reg         (dm2reg),
+        .alu_op         (alu_op),
+        .pc2reg         (pc2reg)
+    );
+
+    auxdec ad (
+        .alu_op         (alu_op),
+        .funct          (funct),
+        .alu_ctrl       (alu_ctrl),
+        .muldiv_ctrl    (muldiv_ctrl),
+        .we_muldiv      (we_muldiv),
+        .hilo_stream    (hilo_stream),
+        .hilo2reg       (hilo2reg),
+        .alu_shamt      (alu_shamt),
+        .jump_reg       (jump_reg)
+    );
+
+endmodule
+// File: datapath.v
+// datapath.v
+module datapath (
+        input  wire        clk,
+        input  wire        rst,
+        input  wire        branch,
+        input  wire        jump,
+        input  wire        we_reg,
+        input  wire        alu_src,
+        input  wire        dm2reg,
+//        input  wire [2:0]  alu_ctrl,
+        input  wire [4:0]  ra3,
+        input  wire [31:0] instr,
+        input  wire [31:0] rd_dm,
+        
+        /* Lab 7 Implementation */
+        input  wire [3:0]  alu_ctrl,
+        input  wire [1:0]  reg_dst,     // Implemented 
+        input  wire [1:0]  muldiv_ctrl, // Implemented
+        input  wire        pc2reg,      // Implemented 
+        input  wire        we_muldiv,   // Implemented 
+        input  wire        hilo_stream, // Implemented 
+        input  wire        hilo2reg,    // Implemented
+        input  wire        alu_shamt,   // Implemented 
+        input  wire        jump_reg,    // Implemented 
+        
+        output wire [31:0] pc_current,
+        output wire [31:0] alu_out,
+        output wire [31:0] wd_dm,
+        output wire [31:0] rd3
+    );
+
+    wire [4:0]  rf_wa;
+    wire        pc_src;
+    wire [31:0] pc_plus4;
+    wire [31:0] pc_pre;
+    wire [31:0] pc_next;
+    wire [31:0] sext_imm;
+    wire [31:0] ba;
+    wire [31:0] bta;
+    wire [31:0] jta;
+    wire [31:0] alu_pa;
+    wire [31:0] alu_pb;
+    wire [31:0] wd_rf;
+    wire        zero;
+    
+    assign pc_src = branch & zero;
+    assign ba = {sext_imm[29:0], 2'b00};
+    assign jta = {pc_plus4[31:28], instr[25:0], 2'b00};
+    
+    /* Lab 7 Implementation */
+    wire [31:0] shamt; 
+    wire [31:0] pc_jmp_reg;
+    wire [31:0] hi;
+    wire [31:0] lo;
+    wire [31:0] wd_rf_hilo;
+    wire [31:0] wd_rf_p1;
+    wire [31:0] wd_rf_p2;
+    wire [31:0] alu_pb_shamt;
+    
+    assign shamt = {27'b0, instr[10:6]};
+    
+    // --- PC Logic --- //
+    dreg pc_reg (
+            .clk            (clk),
+            .rst            (rst),
+            .d              (pc_next),
+            .q              (pc_current)
+        );
+
+    adder pc_plus_4 (
+            .a              (pc_current),
+            .b              (32'd4),
+            .y              (pc_plus4)
+        );
+
+    adder pc_plus_br (
+            .a              (pc_plus4),
+            .b              (ba),
+            .y              (bta)
+        );
+
+    mux2 #(32) pc_src_mux (
+            .sel            (pc_src),
+            .a              (pc_plus4),
+            .b              (bta),
+            .y              (pc_pre)
+        );
+    
+    /* Lab 7 Implementation */    
+    mux2 #(32) pc_jmp_reg_mux (
+            .sel            (jump_reg),
+            .a              (pc_pre),
+            .b              (alu_pa),   // rd1
+            .y              (pc_jmp_reg)
+        );
+
+    mux2 #(32) pc_jmp_mux (
+            .sel            (jump),
+            .a              (pc_jmp_reg),
+            .b              (jta),
+            .y              (pc_next)
+        );
+
+    // --- RF Logic --- //
+//    mux2 #(5) rf_wa_mux (
+//            .sel            (reg_dst),
+//            .a              (instr[20:16]),
+//            .b              (instr[15:11]),
+//            .y              (rf_wa)
+//        );
+    
+    /* Lab 7 Implementation */    
+    mux3 #(5) rf_wa_mux (
+        .sel            (reg_dst),
+        .a              (instr[20:16]),
+        .b              (instr[15:11]),
+        .c              (5'b11111),
+        .y              (rf_wa)
+    );
+
+    regfile rf (
+            .clk            (clk),
+            .we             (we_reg),
+            .ra1            (instr[25:21]),
+            .ra2            (instr[20:16]),
+            .ra3            (ra3),
+            .wa             (rf_wa),
+            .wd             (wd_rf),
+            .rd1            (alu_pa),
+            .rd2            (wd_dm),
+            .rd3            (rd3),
+            .rst            (rst)
+        );
+
+    signext se (
+            .a              (instr[15:0]),
+            .y              (sext_imm)
+        );
+
+    // --- ALU Logic --- //
+    mux2 #(32) alu_pb_mux (
+            .sel            (alu_src),
+            .a              (wd_dm),
+            .b              (sext_imm),
+            .y              (alu_pb)
+        );
+    
+    /* Lab 7 Implementation */    
+    mux2 #(32) alu_shamt_mux (
+            .sel            (alu_shamt),
+            .a              (alu_pb),
+            .b              (shamt),
+            .y              (alu_pb_shamt)
+    );
+
+    alu alu (
+            .op             (alu_ctrl),
+            .a              (alu_pa),
+            .b              (alu_pb_shamt),
+            .zero           (zero),
+            .y              (alu_out)
+        );
+
+    /* Lab 7 Implementation */
+    muldivunit muldivunit (
+            .clk            (clk),
+            .rst            (rst),
+            .muldiv_ctrl    (muldiv_ctrl),
+            .we_muldiv      (we_muldiv),
+            .a              (alu_pa),
+            .b              (wd_dm),
+            .hi_q           (hi),
+            .lo_q           (lo)
+    ); 
+
+    /* Lab 7 Implementation */
+    mux2 #(32) hilo_stream_mux (
+            .sel            (hilo_stream),
+            .a              (lo),
+            .b              (hi),
+            .y              (wd_rf_hilo)
+        );
+        
+    // --- MEM Logic --- //
+    mux2 #(32) rf_wd_p1_mux (
+            .sel            (dm2reg),
+            .a              (alu_out),
+            .b              (rd_dm),
+            .y              (wd_rf_p1)
+        );
+    
+    /* Lab 7 Implementation */
+    mux2 #(32) rf_wd_p2_mux (
+            .sel            (hilo2reg),
+            .a              (wd_rf_p1),
+            .b              (wd_rf_hilo),
+            .y              (wd_rf_p2)
+        );
+    
+    /* Lab 7 Implementation */    
+    mux2 #(32) rf_wd_p3_mux (
+            .sel            (pc2reg),
+            .a              (wd_rf_p2),
+            .b              (pc_plus4),
+            .y              (wd_rf)
+        );
+
+endmodule
+// File: dmem.v
+// dmem.v
+module dmem (
+        input  wire        clk,
+        input  wire        we,
+        input  wire [5:0]  a,
+        input  wire [31:0] d,
+        output wire [31:0] q,
+        input  wire        rst
+    );
+
+    reg [31:0] ram [0:63];
+
+    integer n;
+
+    initial begin
+        for (n = 0; n < 64; n = n + 1) ram[n] = 32'hFFFFFFFF;
+    end
+    
+    always @ (posedge rst) begin
+    end
+
+    always @ (posedge clk, posedge rst) begin
+        if (rst) for (n = 0; n < 64; n = n + 1) ram[n] = 32'hFFFFFFFF;
+        else if (we) ram[a] <= d;
+    end
+
+    assign q = ram[a];
+    
+endmodule
+// File: dreg.v
+// dreg.v
+module dreg # (parameter WIDTH = 32) (
+        input  wire             clk,
+        input  wire             rst,
+        input  wire [WIDTH-1:0] d,
+        output reg  [WIDTH-1:0] q
+    );
+
+    always @ (posedge clk, posedge rst) begin
+        if (rst) q <= 0;
+        else     q <= d;
+    end
+endmodule
+// File: hex_to_7seg.v
+// hex_to_7seg.v
+module hex_to_7seg (
+            input  wire [3:0] HEX,
+            output reg  [7:0] s
+        );
+
+    always @ (HEX) begin
+        case (HEX) 
+               4'h0: s = 8'b11000000;
+               4'h1: s = 8'b11111001;
+               4'h2: s = 8'b10100100;
+               4'h3: s = 8'b10110000;
+               4'h4: s = 8'b10011001;
+               4'h5: s = 8'b10010010;
+               4'h6: s = 8'b10000010;
+               4'h7: s = 8'b11111000;
+               4'h8: s = 8'b10000000;
+               4'h9: s = 8'b10010000;
+               4'hA: s = 8'b10100000; // b10001000; This is capital A
+               4'hB: s = 8'b10000011; // b10000000; This is capital B, but is the same as 8
+               4'hC: s = 8'b10100111; // b11000110; This is capital C
+               4'hD: s = 8'b10100001; // b11000000; This is capital D, but is the same as 0
+               4'hE: s = 8'b10000110;
+               4'hF: s = 8'b10001110;
+            default: s = 8'b01111111;
+       endcase
+    end
+
+endmodule
+// File: imem.v
+// imem.v
+module imem (
+        input  wire [5:0]  a,
+        output wire [31:0] y
+    );
+
+    reg [31:0] rom [0:63];
+
+    initial begin
+        $readmemh ("memfile.dat", rom);
+    end
+
+    assign y = rom[a];
+    
+endmodule
+// File: led_mux.v
+// led_mux.v
+module led_mux (
+        input  wire       clk,
+        input  wire       rst,
+        input  wire [7:0] LED3,
+        input  wire [7:0] LED2,
+        input  wire [7:0] LED1,
+        input  wire [7:0] LED0,
+        output wire [3:0] LEDSEL,
+        output wire [7:0] LEDOUT
+    );
+
+    reg [1:0]  index;
+    reg [11:0] led_ctrl;
+
+    assign {LEDSEL, LEDOUT} = led_ctrl;
+    
+    always @ (posedge clk) index <= (rst) ? 2'b0 : (index + 2'd1);
+    
+    always @ (index, LED0, LED1, LED2, LED3) begin
+        case (index)
+               2'd0: led_ctrl <= {4'b1110, LED0};
+               2'd1: led_ctrl <= {4'b1101, LED1};
+               2'd2: led_ctrl <= {4'b1011, LED2};
+               2'd3: led_ctrl <= {4'b0111, LED3};
+            default: led_ctrl <= {4'b1111, 8'hFF};
+        endcase
+    end
+    
+endmodule
+// File: maindec.v
+// maindec.v
+module maindec (
+        input  wire [5:0] opcode,
+        output wire       branch,
+        output wire       jump,
+        output wire       we_reg,
+        output wire       alu_src,
+        output wire       we_dm,
+        output wire       dm2reg,
+        output wire [1:0] alu_op,
+        
+        /* Lab 7 Modifications */
+//        output wire       reg_dst,
+        output wire [1:0]  reg_dst,     // Originally 1-bit but changing to 2-bit        
+        output wire        pc2reg      // Selecting if we want the program counter to be feed into wd_rf and $ra into rf_wa
+    
+    );
+
+    reg [10:0] ctrl;
+
+    assign {branch, jump, reg_dst, we_reg, alu_src, we_dm, dm2reg, alu_op, pc2reg} = ctrl;
+
+    always @ (opcode) begin
+        case (opcode)
+            6'b00_0000: ctrl = 11'b0_0_01_1_0_0_0_10_0; // R-type
+            6'b00_1000: ctrl = 11'b0_0_00_1_1_0_0_00_0; // ADDI
+            6'b00_0100: ctrl = 11'b1_0_00_0_0_0_0_01_0; // BEQ
+            6'b00_0010: ctrl = 11'b0_1_00_0_0_0_0_00_0; // J
+            6'b00_0011: ctrl = 11'b0_1_10_1_0_0_0_00_1; // JAL
+            6'b10_1011: ctrl = 11'b0_0_00_0_1_1_0_00_0; // SW
+            6'b10_0011: ctrl = 11'b0_0_00_1_1_0_1_00_0; // LW
+            default:    ctrl = 11'bx_x_xx_x_x_x_x_xx_x;
+        endcase
+    end
+
+endmodule
+// File: mips_fpga.v
+// mips_fpga.v
+module mips_fpga (
+        input  wire       clk,
+        input  wire       rst,
+        input  wire       button,
+        input  wire [8:0] switches,
+        output wire       we_dm,
+        output wire [3:0] LEDSEL,
+        output wire [7:0] LEDOUT
+    );
+
+    reg  [15:0] reg_hex;
+    wire        clk_sec;
+    wire        clk_5KHz;
+    wire        clk_pb;
+
+    wire [7:0]  digit0;
+    wire [7:0]  digit1;
+    wire [7:0]  digit2;
+    wire [7:0]  digit3;
+
+    wire [31:0] pc_current;
+    wire [31:0] instr;
+    wire [31:0] alu_out;
+    wire [31:0] wd_dm;
+    wire [31:0] rd_dm;
+    wire [31:0] dispData;
+
+    clk_gen clk_gen (
+            .clk100MHz          (clk),
+            .rst                (rst),
+            .clk_4sec           (clk_sec),
+            .clk_5KHz           (clk_5KHz)
+        );
+
+    button_debouncer bd (
+            .clk                (clk_5KHz),
+            .button             (button),
+            .debounced_button   (clk_pb)
+        );
+
+    mips_top mips_top (
+            .clk                (clk_pb),
+            .rst                (rst),
+            .ra3                (switches[4:0]),
+            .we_dm              (we_dm),
+            .pc_current         (pc_current),
+            .instr              (instr),
+            .alu_out            (alu_out),
+            .wd_dm              (wd_dm),
+            .rd_dm              (rd_dm),
+            .rd3                (dispData)
+        );
+
+    /*
+    switches[4:0] are used as the 3rd read address (ra3) of the RF,
+    dispData is the register contents from the RF's 3rd read port (rd3).
+    */
+
+    hex_to_7seg hex3 (
+            .HEX                (reg_hex[15:12]),
+            .s                  (digit3)
+        );
+
+    hex_to_7seg hex2 (
+            .HEX                (reg_hex[11:8]),
+            .s                  (digit2)
+        );
+
+    hex_to_7seg hex1 (
+            .HEX                (reg_hex[7:4]),
+            .s                  (digit1)
+        );
+
+    hex_to_7seg hex0 (
+            .HEX                (reg_hex[3:0]),
+            .s                  (digit0)
+        );
+
+    led_mux led_mux (
+            .clk                (clk_5KHz),
+            .rst                (rst),
+            .LED3               (digit3),
+            .LED2               (digit2),
+            .LED1               (digit1),
+            .LED0               (digit0),
+            .LEDSEL             (LEDSEL),
+            .LEDOUT             (LEDOUT)
+        );
+    
+    /*
+    switches[8:5] = 0000 : Display lower  half word of register selected by switches[4:0]
+    switches[8:5] = 0001 : Display higher half word of register selected by switches[4:0]
+    switches[8:5] = 0010 : Display lower  half word of 'instr'
+    switches[8:5] = 0011 : Display higher half word of 'instr'
+    switches[8:5] = 0100 : Display lower  half word of 'alu_out'
+    switches[8:5] = 0101 : Display higher half word of 'alu_out'
+    switches[8:5] = 0110 : Display lower  half word of 'wd_dm'
+    switches[8:5] = 0111 : Display higher half word of 'wd_dm'
+
+    switches[8:5] = 1XX0 : Display lower  half word of 'pc_current'
+    switches[8:5] = 1XX1 : Display higher half word of 'pc_current'
+    */
+    
+    always @ (posedge clk) begin
+        case ({switches[8:5]})
+            4'b0000: reg_hex = dispData[15:0];
+            4'b0001: reg_hex = dispData[31:16];
+            4'b0010: reg_hex = instr[15:0];
+            4'b0011: reg_hex = instr[31:16];
+            4'b0100: reg_hex = alu_out[15:0];
+            4'b0101: reg_hex = alu_out[31:16];
+            4'b0110: reg_hex = wd_dm[15:0];
+            4'b1000: reg_hex = pc_current[15:0];
+            4'b1001: reg_hex = pc_current[31:16];
+            default: reg_hex = pc_current[15:0];
+        endcase
+    end
+
+endmodule
+
+// File: mips_top.v
+// mips_top.v
+module mips_top (
+        input  wire        clk,
+        input  wire        rst,
+        input  wire [4:0]  ra3,
+        output wire        we_dm,
+        output wire [31:0] pc_current,
+        output wire [31:0] instr,
+        output wire [31:0] alu_out,
+        output wire [31:0] wd_dm,
+        output wire [31:0] rd_dm,
+        output wire [31:0] rd3
+    );
+
+    wire [31:0] DONT_USE;
+
+    mips mips (
+            .clk            (clk),
+            .rst            (rst),
+            .ra3            (ra3),
+            .instr          (instr),
+            .rd_dm          (rd_dm),
+            .we_dm          (we_dm),
+            .pc_current     (pc_current),
+            .alu_out        (alu_out),
+            .wd_dm          (wd_dm),
+            .rd3            (rd3)
+        );
+
+    imem imem (
+            .a              (pc_current[7:2]),
+            .y              (instr)
+        );
+
+    dmem dmem (
+            .clk            (clk),
+            .we             (we_dm),
+            .a              (alu_out[7:2]),
+            .d              (wd_dm),
+            .q              (rd_dm),
+            .rst            (rst)
+        );
+
+endmodule
+// File: mips.v
+// mips.v
+module mips (
+        input  wire        clk,
+        input  wire        rst,
+        input  wire [4:0]  ra3,
+        input  wire [31:0] instr,
+        input  wire [31:0] rd_dm,
+        output wire        we_dm,
+        output wire [31:0] pc_current,
+        output wire [31:0] alu_out,
+        output wire [31:0] wd_dm,
+        output wire [31:0] rd3
+    );
+    
+    wire       branch;
+    wire       jump;
+    wire       we_reg;
+    wire       alu_src;
+    wire       dm2reg;
+    
+    /* Lab 7 Implementation */
+//    wire       reg_dst;
+//    wire [2:0] alu_ctrl;
+    wire [1:0] reg_dst;
+    wire [3:0] alu_ctrl;
+    wire       pc2reg;
+    wire [1:0] muldiv_ctrl;
+    wire       we_muldiv;
+    wire       hilo_stream;
+    wire       hilo2reg;
+    wire       alu_shamt;
+    wire       jump_reg;
+
+
+    datapath dp (
+            .clk            (clk),
+            .rst            (rst),
+            .branch         (branch),
+            .jump           (jump),
+//            .reg_dst        (reg_dst),
+            .we_reg         (we_reg),
+            .alu_src        (alu_src),
+            .dm2reg         (dm2reg),
+//            .alu_ctrl       (alu_ctrl),
+            .ra3            (ra3),
+            .instr          (instr),
+            .rd_dm          (rd_dm),
+            
+            /* Lab 7 Implementation */
+            .reg_dst        (reg_dst),
+            .alu_ctrl       (alu_ctrl),
+            .muldiv_ctrl    (muldiv_ctrl),
+            .pc2reg         (pc2reg),
+            .we_muldiv      (we_muldiv),
+            .hilo_stream    (hilo_stream),
+            .hilo2reg       (hilo2reg),
+            .alu_shamt      (alu_shamt),
+            .jump_reg       (jump_reg),
+            
+            .pc_current     (pc_current),
+            .alu_out        (alu_out),
+            .wd_dm          (wd_dm),
+            .rd3            (rd3)
+        );
+
+    controlunit cu (
+            .opcode         (instr[31:26]),
+            .funct          (instr[5:0]),
+            .branch         (branch),
+            .jump           (jump),
+//            .reg_dst        (reg_dst),
+            .we_reg         (we_reg),
+            .alu_src        (alu_src),
+            .we_dm          (we_dm),
+            .dm2reg         (dm2reg),
+//            .alu_ctrl       (alu_ctrl)
+            
+            /* Lab 7 Implementation */
+            .reg_dst        (reg_dst),
+            .alu_ctrl       (alu_ctrl),
+            .muldiv_ctrl    (muldiv_ctrl),
+            .pc2reg         (pc2reg),
+            .we_muldiv      (we_muldiv),
+            .hilo_stream    (hilo_stream),
+            .hilo2reg       (hilo2reg),
+            .alu_shamt      (alu_shamt),
+            .jump_reg       (jump_reg)
+        );
+
+endmodule
+// File: muldivunit.v
+// muldivunit.v
+module muldivunit (
+        input wire clk,
+        input wire rst,
+        
+        input wire [1:0] muldiv_ctrl,
+        input wire we_muldiv,
+        input wire [31:0] a,
+        input wire [31:0] b,
+        
+        output wire [31:0] hi_q,
+        output wire [31:0] lo_q        
+    );
+    
+    
+    reg [31:0] HI, LO;
+    reg [31:0] next_HI, next_LO;
+        
+    initial begin
+        HI = 32'h0;
+        LO = 32'h0;
+    end
+    
+    always @ (a, b, muldiv_ctrl) begin
+        next_HI = HI;
+        next_LO = LO;
+        
+        case (muldiv_ctrl)
+            2'b00: {next_HI, next_LO} = a * b; // MULTU
+//            2'b01: // MULT
+//            2'b10: // DIVU
+//            2'b11: //DIV
+            default:  begin end
+        endcase
+    end
+    
+    always @ (posedge clk, posedge rst) begin
+        if (rst) begin
+            HI <= 32'h0;
+            LO <= 32'h0;
+        end
+        else if (we_muldiv) begin
+            HI <= next_HI;
+            LO <= next_LO;
+        end
+    end
+    
+    assign hi_q = HI;
+    assign lo_q = LO;
+endmodule
+// File: mux2.v
+// mux2.v 
+module mux2 #(parameter WIDTH = 8) (
+        input  wire             sel,
+        input  wire [WIDTH-1:0] a,
+        input  wire [WIDTH-1:0] b, 
+        output wire [WIDTH-1:0] y
+    );
+
+    assign y = (sel) ? b : a;
+
+endmodule
+// File: mux3.v
+// mux3.v
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 10/31/2025 12:26:27 AM
+// Design Name: 
+// Module Name: mux3
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module mux3 #(parameter WIDTH = 8) (
+        input  wire [1:0]       sel,
+        input  wire [WIDTH-1:0] a,
+        input  wire [WIDTH-1:0] b,
+        input  wire [WIDTH-1:0] c,
+        
+        output reg [WIDTH-1:0] y
+    );
+    
+    always @ (a, b, c, sel) begin
+        case (sel) 
+            2'b00: y = a;
+            2'b01: y = b;
+            2'b10: y = c;
+        endcase
+    end
+endmodule
+
+// File: regfile.v
+// regfile.v
+module regfile (
+        input  wire        clk,
+        input  wire        we,
+        input  wire [4:0]  ra1,
+        input  wire [4:0]  ra2,
+        input  wire [4:0]  ra3,
+        input  wire [4:0]  wa,
+        input  wire [31:0] wd,
+        output wire [31:0] rd1,
+        output wire [31:0] rd2,
+        output wire [31:0] rd3,
+        input  wire        rst
+    );
+
+    reg [31:0] rf [0:31];
+
+    integer n;
+    
+    initial begin
+        for (n = 0; n < 32; n = n + 1) rf[n] = 32'h0;
+        rf[29] = 32'h100; // Initialze $sp
+    end
+    
+    always @ (posedge clk, posedge rst) begin
+        if (rst) begin
+            for (n = 0; n < 32; n = n + 1) rf[n] = 32'h0;
+            rf[29] = 32'h100; // Initialze $sp
+        end
+        else if (we) rf[wa] <= wd;
+    end
+
+    assign rd1 = (ra1 == 0) ? 0 : rf[ra1];
+    assign rd2 = (ra2 == 0) ? 0 : rf[ra2];
+    assign rd3 = (ra3 == 0) ? 0 : rf[ra3];
+
+endmodule
+// File: signext.v
+// signext.v
+module signext (
+        input  wire [15:0] a,
+        output wire [31:0] y
+    );
+
+    assign y = {{16{a[15]}}, a};
+    
+endmodule
