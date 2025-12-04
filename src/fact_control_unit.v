@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-module control_unit(
+module fact_control_unit(
     input wire clk,
     input wire go, // User input 
     input data_error, // From the datapath
